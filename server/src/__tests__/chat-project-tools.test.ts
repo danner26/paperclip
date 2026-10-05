@@ -49,13 +49,21 @@ const support = await getEmbeddedPostgresTestSupport();
     async (ownership) => {
       const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
       await server.db.update(agents).set({ permissions: { canAssignTasks: true } }).where(eq(agents.id, f.agentId));
+      const explicitAgentId = randomUUID();
+      if (ownership === "agent") {
+        await server.db.insert(agents).values({
+          id: explicitAgentId, companyId: f.companyId, name: "Explicit task owner",
+          adapterType: "paperclip_runner", status: "active",
+          runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+        });
+      }
       const humanOwned = ownership.startsWith("human");
       const args = ownership === "omitted" ? {}
         : ownership === "unassigned" ? { assigneeActorId: null }
-        : ownership === "agent" ? { assigneeActorId: f.agentId }
+        : ownership === "agent" ? { assigneeActorId: explicitAgentId }
         : { assigneeUserId: f.responsibleUserId, ...(ownership === "human-with-null-agent" ? { assigneeActorId: null } : {}) };
       const expected = {
-        assigneeAgentId: humanOwned || ownership === "unassigned" ? null : f.agentId,
+        assigneeAgentId: humanOwned || ownership === "unassigned" ? null : ownership === "agent" ? explicitAgentId : f.agentId,
         assigneeUserId: humanOwned ? f.responsibleUserId : null,
         status: "todo",
       };
