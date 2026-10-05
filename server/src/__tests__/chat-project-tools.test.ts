@@ -1,4 +1,4 @@
-import { callProjectTool } from "../services/project-tools.js";
+import { callProjectTool, projectToolDefinitions } from "../services/project-tools.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -18,6 +18,81 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); server = await startRunnerApiTestServer(); }, 60_000);
   afterAll(async () => { await server?.close(); if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret; });
   const call = (fixture: Awaited<ReturnType<typeof server.fixture>>, tool: string, args: Record<string, unknown>) => fixture.authority.execute({ tool, arguments: args, callId: randomUUID() });
+
+  const createChatTask = (f: Awaited<ReturnType<typeof server.fixture>>, args: Record<string, unknown>) => callProjectTool({
+    name: "create_task", arguments: { title: "Ownership verification", idempotencyKey: "ownership", ...args },
+    apiUrl: server.apiUrl, token: createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!,
+    companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: true,
+  });
+
+  it.each(["omitted", "unassigned", "agent", "human", "human-with-null-agent"] as const)(
+    "preserves %s ownership through the chat tool and authenticated issue API",
+    async (ownership) => {
+      const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+      await server.db.update(agents).set({ permissions: { canAssignTasks: true } }).where(eq(agents.id, f.agentId));
+      const humanOwned = ownership.startsWith("human");
+      const args = ownership === "omitted" ? {}
+        : ownership === "unassigned" ? { assigneeActorId: null }
+        : ownership === "agent" ? { assigneeActorId: f.agentId }
+        : { assigneeUserId: f.responsibleUserId, ...(ownership === "human-with-null-agent" ? { assigneeActorId: null } : {}) };
+      const expected = {
+        assigneeAgentId: humanOwned || ownership === "unassigned" ? null : f.agentId,
+        assigneeUserId: humanOwned ? f.responsibleUserId : null,
+        status: "todo",
+      };
+      const result = await createChatTask(f, args);
+      expect(result).toMatchObject(expected);
+      const [saved] = await server.db.select().from(issues).where(eq(issues.id, result.id));
+      expect(saved).toMatchObject(expected);
+      const [conversation] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(conversation.status).toBe("in_progress");
+      if (humanOwned || ownership === "unassigned") {
+        expect(await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, result.id))).toHaveLength(0);
+      }
+    },
+  );
+
+  it("preserves human ownership and pending status on idempotent replay, including changed ownership inputs", async () => {
+    const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+    await server.db.update(agents).set({ permissions: { canAssignTasks: true } }).where(eq(agents.id, f.agentId));
+    const first = await createChatTask(f, { assigneeUserId: f.responsibleUserId });
+    const again = await createChatTask(f, { assigneeUserId: f.responsibleUserId });
+    const changedRetry = await createChatTask(f, { assigneeActorId: f.agentId });
+    const expected = { id: first.id, assigneeAgentId: null, assigneeUserId: f.responsibleUserId, status: "todo" };
+    expect(again).toMatchObject(expected);
+    expect(changedRetry).toMatchObject(expected);
+    expect(await server.db.select().from(issues).where(eq(issues.id, first.id))).toEqual([expect.objectContaining(expected)]);
+  });
+
+  it("rejects mutually exclusive, invalid and cross-company human owners", async () => {
+    const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+    const foreign = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+    await server.db.update(agents).set({ permissions: { canAssignTasks: true } }).where(eq(agents.id, f.agentId));
+    const before = await server.db.select().from(issues).where(eq(issues.companyId, f.companyId));
+    await expect(createChatTask(f, { assigneeUserId: f.responsibleUserId, assigneeActorId: f.agentId })).rejects.toThrow(/either a human or an agent/);
+    for (const assigneeUserId of [" ", null, 123, "missing-user", foreign.responsibleUserId]) {
+      await expect(createChatTask(f, { assigneeUserId })).rejects.toThrow();
+    }
+    expect(await server.db.select().from(issues).where(eq(issues.companyId, f.companyId))).toHaveLength(before.length);
+  });
+
+  it.each(["planning", "ask"] as const)("retains %s mode restrictions for human-owned task creation", async (mode) => {
+    const f = await server.fixture({ conversation: true, mode, disableWakeOnDemand: true });
+    await server.db.update(agents).set({ permissions: { canAssignTasks: true } }).where(eq(agents.id, f.agentId));
+    await expect(createChatTask(f, { assigneeUserId: f.responsibleUserId })).rejects.toThrow();
+    expect(projectToolDefinitions(mode, true).some(tool => tool.name === "create_task")).toBe(false);
+  });
+
+  it("advertises human ownership only on the existing task tool in permitted modes", () => {
+    const tools = projectToolDefinitions("standard", true);
+    const task = tools.find(tool => tool.name === "create_task")!;
+    expect(task.inputSchema.properties).toHaveProperty("assigneeUserId");
+    expect(task.inputSchema.required).not.toContain("assigneeUserId");
+    expect(task.description).toContain("leave the task unassigned");
+    expect(tools.some(tool => tool.name === "set_task_title")).toBe(true);
+    expect(tools.filter(tool => tool.name !== "create_task").every(tool => !("assigneeUserId" in (tool.inputSchema.properties ?? {})))).toBe(true);
+    expect(projectToolDefinitions("standard").some(tool => tool.name === "create_task")).toBe(false);
+  });
 
   it("allows a conversation reply to enter review without manufacturing a review interaction", async () => {
     const f = await server.fixture({ conversation: true });
