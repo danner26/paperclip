@@ -1,4 +1,6 @@
 import express from "express";
+import { createTeamsAdapter } from "@chat-adapter/teams";
+import { ConsoleLogger } from "chat";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -18,7 +20,8 @@ function fixture(mode: (typeof modes)[number], maxRequests = 20) {
   const actors: unknown[] = [];
   const handleWebhook = vi.fn(async (_id: string, _provider: string, req: Request) => {
     // Model provider authentication with a synthetic token. These tests prove
-    // delegation; the adapter's token verification is covered separately.
+    // delegation; the real adapter rejection cases below cover missing and
+    // malformed provider credentials without contacting Microsoft.
     const authorization = req.headers.get("authorization");
     const providerAccepted = authorization === providerAuthorization;
     return Response.json(
@@ -42,6 +45,30 @@ function fixture(mode: (typeof modes)[number], maxRequests = 20) {
 }
 
 describe.each(modes)("Teams webhook actor boundary in %s mode", (mode) => {
+  it.each([undefined, "Bearer invalid"])(
+    "retains the pinned Teams adapter's rejection of %s",
+    async (authorization) => {
+      const adapter = createTeamsAdapter({
+        appId: "11111111-1111-4111-8111-111111111111",
+        appTenantId: "22222222-2222-4222-8222-222222222222",
+        appPassword: "synthetic-unused-secret",
+        appType: "SingleTenant",
+        logger: new ConsoleLogger("silent"),
+      });
+      // Rejection happens before the adapter can dispatch to the chat instance.
+      await adapter.initialize({} as Parameters<typeof adapter.initialize>[0]);
+      const f = fixture(mode);
+      f.handleWebhook.mockImplementation((_id, _provider, req) => adapter.handleWebhook(req));
+      let req = request(f.app).post(webhookPath);
+      if (authorization) req = req.set("authorization", authorization);
+      const res = await req.send({ type: "message", id: "synthetic-message", channelId: "msteams" });
+      expect(res.status).toBe(401);
+      expect(res.body.error).toBe(authorization ? "JWT validation failed" : "Missing authorization header");
+      expect(f.handleWebhook).toHaveBeenCalledOnce();
+      expect(f.actors).toEqual([{ type: "none", source: "none" }]);
+    },
+  );
+
   it("delegates a canonical POST with the original credentials and body and no actor", async () => {
     const f = fixture(mode);
     const body = '{ "type": "message", "text": "test fixture" }';
