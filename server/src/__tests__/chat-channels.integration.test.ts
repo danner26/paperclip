@@ -15104,7 +15104,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await db.update(chatConversations).set({ endpointId: other.endpoint.id }).where(eq(chatConversations.endpointId, endpoint.id));
       } else if (mode === "other-company") {
         const other = await seedCompany();
-        await db.update(chatConversations).set({ companyId: other.companyId }).where(eq(chatConversations.endpointId, endpoint.id));
+        const foreign = await configuredTeamsEndpoint(other);
+        await deliverMessage({
+          callbacks: foreign.callbacks, endpointId: foreign.endpoint.id, provider: "microsoft-teams", thread,
+          message: makeMessage({ id: "teams-personal-setup-root", text: "Verify personal setup", userId: "teams-personal-user" }),
+          trigger: "direct_message",
+        });
+        await qualifySetupRoundTrip(foreign.service, foreign.endpoint.id, "teams-personal-user", "direct_message");
+        await db.update(chatDeliveries).set({ state: "received" }).where(eq(chatDeliveries.endpointId, endpoint.id));
       }
 
       if (mode === "personal") {
