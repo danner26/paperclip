@@ -15,15 +15,34 @@ const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("chat project tool handoff", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
   const originalSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
-  beforeAll(async () => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); server = await startRunnerApiTestServer(); }, 60_000);
-  afterAll(async () => { await server?.close(); if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret; });
+  const originalApiUrl = process.env.PAPERCLIP_API_URL;
+  beforeAll(async () => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); server = await startRunnerApiTestServer(); process.env.PAPERCLIP_API_URL = server.apiUrl; }, 60_000);
+  afterAll(async () => {
+    await server?.close();
+    if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret;
+    if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL; else process.env.PAPERCLIP_API_URL = originalApiUrl;
+  });
   const call = (fixture: Awaited<ReturnType<typeof server.fixture>>, tool: string, args: Record<string, unknown>) => fixture.authority.execute({ tool, arguments: args, callId: randomUUID() });
 
-  const createChatTask = (f: Awaited<ReturnType<typeof server.fixture>>, args: Record<string, unknown>) => callProjectTool({
-    name: "create_task", arguments: { title: "Ownership verification", idempotencyKey: "ownership", ...args },
-    apiUrl: server.apiUrl, token: createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!,
-    companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: true,
-  });
+  const callChatMcp = async (f: Awaited<ReturnType<typeof server.fixture>>, method: string, params: Record<string, unknown> = {}) => {
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const response = await fetch(`${server.apiUrl}/api/mcp/project-tools`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method, params }),
+    });
+    expect(response.status).toBe(200);
+    const envelope = await response.json();
+    expect(envelope.error).toBeUndefined();
+    return envelope.result;
+  };
+  const createChatTask = async (f: Awaited<ReturnType<typeof server.fixture>>, args: Record<string, unknown>) => {
+    const result = await callChatMcp(f, "tools/call", {
+      name: "create_task", arguments: { title: "Ownership verification", idempotencyKey: "ownership", ...args },
+    });
+    if (result.isError) throw new Error(result.content[0].text);
+    return result.structuredContent;
+  };
 
   it.each(["omitted", "unassigned", "agent", "human", "human-with-null-agent"] as const)(
     "preserves %s ownership through the chat tool and authenticated issue API",
@@ -80,11 +99,13 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await server.fixture({ conversation: true, mode, disableWakeOnDemand: true });
     await server.db.update(agents).set({ permissions: { canAssignTasks: true } }).where(eq(agents.id, f.agentId));
     await expect(createChatTask(f, { assigneeUserId: f.responsibleUserId })).rejects.toThrow();
+    expect((await callChatMcp(f, "tools/list")).tools.some((tool: { name: string }) => tool.name === "create_task")).toBe(false);
     expect(projectToolDefinitions(mode, true).some(tool => tool.name === "create_task")).toBe(false);
   });
 
-  it("advertises human ownership only on the existing task tool in permitted modes", () => {
-    const tools = projectToolDefinitions("standard", true);
+  it("advertises human ownership only on the existing task tool in permitted modes", async () => {
+    const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+    const tools: ReturnType<typeof projectToolDefinitions> = (await callChatMcp(f, "tools/list")).tools;
     const task = tools.find(tool => tool.name === "create_task")!;
     expect(task.inputSchema.properties).toHaveProperty("assigneeUserId");
     expect(task.inputSchema.required).not.toContain("assigneeUserId");
