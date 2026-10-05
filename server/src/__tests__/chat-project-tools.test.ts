@@ -1,6 +1,7 @@
 import { callProjectTool, projectToolDefinitions } from "../services/project-tools.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { randomUUID } from "node:crypto";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, issues, heartbeatRuns, projects, companyMemberships, executionWorkspaces } from "@paperclipai/db";
@@ -67,6 +68,10 @@ const support = await getEmbeddedPostgresTestSupport();
         assigneeUserId: humanOwned ? f.responsibleUserId : null,
         status: "todo",
       };
+      const { tools } = await callChatMcp(f, "tools/list");
+      const task = tools.find((tool: { name: string }) => tool.name === "create_task");
+      const validate = new Ajv2020({ strict: true, allErrors: true }).compile(task.inputSchema);
+      expect(validate({ title: "Ownership verification", idempotencyKey: "ownership", ...args }), JSON.stringify(validate.errors)).toBe(true);
       const result = await createChatTask(f, args);
       expect(result).toMatchObject(expected);
       const [saved] = await server.db.select().from(issues).where(eq(issues.id, result.id));
@@ -111,12 +116,22 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(projectToolDefinitions(mode, true).some(tool => tool.name === "create_task")).toBe(false);
   });
 
-  it("advertises human ownership only on the existing task tool in permitted modes", async () => {
-    const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+  it.each(["standard", "skill_test"] as const)("advertises valid ownership inputs only on the existing task tool in %s mode", async (mode) => {
+    const f = await server.fixture({ conversation: true, mode, disableWakeOnDemand: true });
     const tools: ReturnType<typeof projectToolDefinitions> = (await callChatMcp(f, "tools/list")).tools;
     const task = tools.find(tool => tool.name === "create_task")!;
     expect(task.inputSchema.properties).toHaveProperty("assigneeUserId");
     expect(task.inputSchema.required).not.toContain("assigneeUserId");
+    const validate = new Ajv2020({ strict: true, allErrors: true }).compile(task.inputSchema);
+    const input = { title: "Schema ownership verification", idempotencyKey: "schema-ownership" };
+    expect(validate({ ...input, assigneeActorId: null }), JSON.stringify(validate.errors)).toBe(true);
+    expect(validate({ ...input, assigneeUserId: f.responsibleUserId, assigneeActorId: null }), JSON.stringify(validate.errors)).toBe(true);
+    for (const assigneeActorId of [123, false, {}, []]) {
+      expect(validate({ ...input, assigneeActorId })).toBe(false);
+    }
+    for (const assigneeUserId of [null, 123, false, {}, [], ""]) {
+      expect(validate({ ...input, assigneeUserId })).toBe(false);
+    }
     expect(task.description).toContain("leave the task unassigned");
     expect(tools.some(tool => tool.name === "set_task_title")).toBe(true);
     expect(tools.filter(tool => tool.name !== "create_task").every(tool => !("assigneeUserId" in (tool.inputSchema.properties ?? {})))).toBe(true);
